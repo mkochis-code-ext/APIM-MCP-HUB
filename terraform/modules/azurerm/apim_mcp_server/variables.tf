@@ -29,22 +29,6 @@ variable "backend_url" {
   type        = string
 }
 
-variable "entra_tenant_id" {
-  description = "Entra tenant GUID for validate-azure-ad-token"
-  type        = string
-}
-
-variable "client_app_ids_xml" {
-  description = "Optional pre-rendered <client-application-ids> block for validate-azure-ad-token (empty string to skip)"
-  type        = string
-  default     = ""
-}
-
-variable "mcp_api_app_id" {
-  description = "Application (client) ID of the API app - token audience + OBO client id"
-  type        = string
-}
-
 variable "auth" {
   description = "Backend auth mode: \"obo\" (per-user token exchange) or \"none\" (public backend, caller auth stripped)"
   type        = string
@@ -56,20 +40,9 @@ variable "auth" {
 }
 
 variable "obo_scope" {
-  description = "Entra scope for the OBO exchange (required when auth = \"obo\")"
+  description = "Entra scope for the OBO exchange (required when auth = \"obo\"; consumed by the shared mcp-obo-exchange fragment)"
   type        = string
   default     = ""
-}
-
-variable "obo_secret_named_value" {
-  description = "Name of the secret named value holding the OBO client secret"
-  type        = string
-}
-
-variable "obo_cache_seconds" {
-  description = "Cache TTL for exchanged OBO tokens (must be below token lifetime)"
-  type        = number
-  default     = 3000
 }
 
 variable "tools_cache_seconds" {

@@ -67,19 +67,14 @@ resource "azurerm_api_management_named_value" "acl" {
 
 locals {
   policy_xml = templatefile("${path.module}/templates/mcp-server-policy.xml.tftpl", {
-    server_name            = var.server_name
-    backend_url            = var.backend_url
-    entra_tenant_id        = var.entra_tenant_id
-    client_app_ids_xml     = var.client_app_ids_xml
-    mcp_api_app_id         = var.mcp_api_app_id
-    auth                   = var.auth
-    obo_scope              = var.obo_scope
-    obo_secret_named_value = var.obo_secret_named_value
-    obo_cache_seconds      = var.obo_cache_seconds
-    tools_cache_seconds    = var.tools_cache_seconds
-    rate_limit_calls       = var.rate_limit_calls
-    rate_limit_period      = var.rate_limit_period
-    acl_fragment_id        = var.acl_fragment_id
+    server_name         = var.server_name
+    backend_url         = var.backend_url
+    auth                = var.auth
+    obo_scope           = var.obo_scope
+    tools_cache_seconds = var.tools_cache_seconds
+    rate_limit_calls    = var.rate_limit_calls
+    rate_limit_period   = var.rate_limit_period
+    acl_fragment_id     = var.acl_fragment_id
   })
 }
 

@@ -1,0 +1,66 @@
+<!--
+  Shared fragment (mcp-obo-exchange): per-user OBO token exchange for servers with
+  auth = "obo". Cache lookup -> jwt-bearer exchange -> cache store; a failed
+  exchange emits a debug trace and returns the Entra error body as 502 (the hub's
+  tools/list fan-out drops it; tools/call surfaces it). The failure trace is
+  inlined (formerly the mcp-debug-obo fragment) because fragments cannot nest.
+
+  CONTRACT - variables read (set by the including policy BEFORE the include):
+    mcpServer (string)  server key: OBO cache-key prefix + trace attribution
+    callerOid (string)  produced by mcp-validate-token
+    rpcMethod (string)  parsed JSON-RPC method
+    aclResult (string)  produced by mcp-acl-eval
+    oboScope  (string)  Entra scope requested in the exchange
+  Produces (only when the ACL matched AND rpcMethod is tools/list or tools/call):
+    backendToken (string) cached under "<mcpServer>-obo-<oid>" for ${obo_cache_seconds}s
+                          (safely below Entra's 60-minute minimum token lifetime)
+
+  Emits the Entra error body (AADSTS code + description) on failure. Trace metadata
+  truncates the body to 800 chars (the 502 response returns the full body).
+-->
+<fragment>
+  <choose>
+    <when condition="@(JObject.Parse((string)context.Variables[&quot;aclResult&quot;])[&quot;matched&quot;].HasValues &amp;&amp; ((string)context.Variables[&quot;rpcMethod&quot;] == &quot;tools/list&quot; || (string)context.Variables[&quot;rpcMethod&quot;] == &quot;tools/call&quot;))">
+      <cache-lookup-value key="@((string)context.Variables[&quot;mcpServer&quot;] + &quot;-obo-&quot; + (string)context.Variables[&quot;callerOid&quot;])" variable-name="backendToken" />
+      <choose>
+        <when condition="@(!context.Variables.ContainsKey(&quot;backendToken&quot;))">
+          <send-request mode="new" response-variable-name="oboResp" timeout="20" ignore-error="false">
+            <set-url>https://login.microsoftonline.com/${entra_tenant_id}/oauth2/v2.0/token</set-url>
+            <set-method>POST</set-method>
+            <set-header name="Content-Type" exists-action="override">
+              <value>application/x-www-form-urlencoded</value>
+            </set-header>
+            <set-body>@("client_id=${mcp_api_app_id}" + "&amp;client_secret=" + System.Uri.EscapeDataString("{{${obo_secret_named_value}}}") + "&amp;grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" + "&amp;assertion=" + System.Uri.EscapeDataString(context.Request.Headers.GetValueOrDefault("Authorization","").Replace("Bearer ","")) + "&amp;scope=" + System.Uri.EscapeDataString((string)context.Variables["oboScope"]) + "&amp;requested_token_use=on_behalf_of")</set-body>
+          </send-request>
+          <choose>
+            <when condition="@(((IResponse)context.Variables[&quot;oboResp&quot;]).StatusCode &gt;= 400)">
+              <choose>
+                <when condition="@(&quot;{{mcp-hub-debug}}&quot; == &quot;true&quot;)">
+                  <trace source="MCP" severity="error">
+                    <message>MCP server OBO exchange failed</message>
+                    <metadata name="mcp-server" value="@((string)context.Variables.GetValueOrDefault(&quot;mcpServer&quot;, &quot;unknown&quot;))" />
+                    <metadata name="caller-oid" value="@((string)context.Variables[&quot;callerOid&quot;])" />
+                    <metadata name="obo-status" value="@(((IResponse)context.Variables[&quot;oboResp&quot;]).StatusCode.ToString())" />
+                    <metadata name="obo-error" value="@{
+                        var body = ((IResponse)context.Variables[&quot;oboResp&quot;]).Body.As&lt;string&gt;(preserveContent: true) ?? &quot;&quot;;
+                        return body.Length &gt; 800 ? body.Substring(0, 800) : body;
+                    }" />
+                  </trace>
+                </when>
+              </choose>
+              <return-response>
+                <set-status code="502" reason="OBO exchange failed" />
+                <set-header name="Content-Type" exists-action="override">
+                  <value>application/json</value>
+                </set-header>
+                <set-body>@(((IResponse)context.Variables["oboResp"]).Body.As&lt;string&gt;(preserveContent: true) ?? "")</set-body>
+              </return-response>
+            </when>
+          </choose>
+          <set-variable name="backendToken" value="@((string)JObject.Parse(((IResponse)context.Variables[&quot;oboResp&quot;]).Body.As&lt;string&gt;(preserveContent: true))[&quot;access_token&quot;])" />
+          <cache-store-value key="@((string)context.Variables[&quot;mcpServer&quot;] + &quot;-obo-&quot; + (string)context.Variables[&quot;callerOid&quot;])" value="@((string)context.Variables[&quot;backendToken&quot;])" duration="${obo_cache_seconds}" />
+        </when>
+      </choose>
+    </when>
+  </choose>
+</fragment>
