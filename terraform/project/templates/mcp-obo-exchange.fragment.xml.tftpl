@@ -15,8 +15,8 @@
     backendToken (string) cached under "<mcpServer>-obo-<oid>" for ${obo_cache_seconds}s
                           (safely below Entra's 60-minute minimum token lifetime)
 
-  Emits the Entra error body (AADSTS code + description, truncated to 800 chars)
-  on failure - never tokens or secrets.
+  Emits the Entra error body (AADSTS code + description) on failure. Trace metadata
+  truncates the body to 800 chars (the 502 response returns the full body).
 -->
 <fragment>
   <choose>
