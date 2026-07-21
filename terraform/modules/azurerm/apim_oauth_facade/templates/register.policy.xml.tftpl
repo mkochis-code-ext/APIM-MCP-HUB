@@ -1,0 +1,45 @@
+<!--
+    Dynamic Client Registration shim (POST /register, RFC 7591).
+    Microsoft Entra ID does not support DCR, so this endpoint returns the pre-registered
+    public client (the VS Code app registration) as the client_id and echoes the
+    requested redirect_uris. The MCP client then uses this client_id for /authorize and
+    /token. No client secret is issued (public client + PKCE).
+-->
+<policies>
+    <inbound>
+        <return-response>
+            <set-status code="201" reason="Created" />
+            <set-header name="Content-Type" exists-action="override">
+                <value>application/json; charset=utf-8</value>
+            </set-header>
+            <set-header name="Access-Control-Allow-Origin" exists-action="override">
+                <value>*</value>
+            </set-header>
+            <set-body><![CDATA[@{
+                var body = context.Request.Body?.As<Newtonsoft.Json.Linq.JObject>(preserveContent: true);
+                // DeepClone: the token is still parented to the request body JObject and
+                // re-parenting it into the response JObject fails in the policy sandbox.
+                var redirectUris = (body != null && body["redirect_uris"] != null)
+                    ? body["redirect_uris"].DeepClone()
+                    : (Newtonsoft.Json.Linq.JToken)new Newtonsoft.Json.Linq.JArray();
+                var resp = new Newtonsoft.Json.Linq.JObject();
+                resp["client_id"] = "${mcp_client_id}";
+                resp["client_id_issued_at"] = System.DateTimeOffset.UtcNow.ToUnixTimeSeconds();
+                resp["redirect_uris"] = redirectUris;
+                resp["token_endpoint_auth_method"] = "none";
+                resp["grant_types"] = new Newtonsoft.Json.Linq.JArray("authorization_code", "refresh_token");
+                resp["response_types"] = new Newtonsoft.Json.Linq.JArray("code");
+                return resp.ToString(Newtonsoft.Json.Formatting.None);
+            }]]></set-body>
+        </return-response>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

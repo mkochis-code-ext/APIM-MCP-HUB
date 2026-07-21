@@ -1,0 +1,27 @@
+<!--
+  Debug fragment (mcp-debug-obo): OBO exchange failure trace, gated on the
+  mcp-hub-debug named value. Included by per-server policies immediately before the
+  502 return-response.
+
+  CONTRACT - variables read:
+    mcpServer (string), callerOid (string), oboResp (IResponse, StatusCode >= 400)
+
+  Emits the Entra error body (AADSTS code + description, truncated to 800 chars) -
+  never tokens or secrets.
+-->
+<fragment>
+  <choose>
+    <when condition="@(&quot;{{mcp-hub-debug}}&quot; == &quot;true&quot;)">
+      <trace source="MCP" severity="error">
+        <message>MCP server OBO exchange failed</message>
+        <metadata name="mcp-server" value="@((string)context.Variables.GetValueOrDefault(&quot;mcpServer&quot;, &quot;unknown&quot;))" />
+        <metadata name="caller-oid" value="@((string)context.Variables[&quot;callerOid&quot;])" />
+        <metadata name="obo-status" value="@(((IResponse)context.Variables[&quot;oboResp&quot;]).StatusCode.ToString())" />
+        <metadata name="obo-error" value="@{
+            var body = ((IResponse)context.Variables[&quot;oboResp&quot;]).Body.As&lt;string&gt;(preserveContent: true) ?? &quot;&quot;;
+            return body.Length &gt; 800 ? body.Substring(0, 800) : body;
+        }" />
+      </trace>
+    </when>
+  </choose>
+</fragment>

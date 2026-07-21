@@ -1,0 +1,37 @@
+<!--
+    Token endpoint (POST /token).
+    Transparent proxy to Entra's token endpoint. VS Code sends the authorization code,
+    PKCE code_verifier, client_id (the pre-registered public client) and redirect_uri;
+    Entra validates PKCE and returns the access + refresh tokens. The resulting access
+    token has audience api://<mcp_api_app_id>, which the hub policy validates.
+
+    The RFC 8707 `resource` parameter MCP clients include (set to the PRM resource,
+    e.g. https://<gateway>/mcp-hub/mcp) is stripped from the form body before
+    proxying: Entra validates it against the scope's audience (api://<app-id>) and
+    rejects the mismatch with AADSTS9010010, which stalls the client's token exchange
+    and shows up as an endless initialize loop. The authorize policy drops the same
+    parameter from its query string.
+-->
+<policies>
+    <inbound>
+        <base />
+        <set-backend-service base-url="https://login.microsoftonline.com/${tenant_id}/oauth2/v2.0" />
+        <rewrite-uri template="/token" />
+        <set-body>@{
+            var body = context.Request.Body?.As&lt;string&gt;(preserveContent: true) ?? "";
+            return string.Join("&amp;", body.Split('&amp;').Where(p =&gt; !p.StartsWith("resource=")));
+        }</set-body>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <set-header name="Access-Control-Allow-Origin" exists-action="override">
+            <value>*</value>
+        </set-header>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

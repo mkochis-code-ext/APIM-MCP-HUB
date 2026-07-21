@@ -1,0 +1,19 @@
+<!--
+    Protected Resource Metadata (RFC 9728), served at
+    <gateway>/.well-known/oauth-protected-resource. Content is the Terraform-rendered
+    prm_metadata_json document (resource, authorization_servers, scopes).
+-->
+<policies>
+  <inbound>
+    <base />
+    <return-response>
+      <set-status code="200" reason="OK" />
+      <set-header name="Content-Type" exists-action="override"><value>application/json</value></set-header>
+      <set-header name="Access-Control-Allow-Origin" exists-action="override"><value>*</value></set-header>
+      <set-body>${prm_json}</set-body>
+    </return-response>
+  </inbound>
+  <backend><base /></backend>
+  <outbound><base /></outbound>
+  <on-error><base /></on-error>
+</policies>

@@ -1,0 +1,46 @@
+<!--
+    Authorization endpoint (GET /authorize).
+    The MCP client opens this in a browser. We 302-redirect to Entra's real authorize
+    endpoint, forcing the pre-registered public client_id and the API scope, and
+    passing the client's PKCE challenge, redirect_uri and state straight through so
+    PKCE is validated end-to-end between VS Code and Entra. The RFC 8707 `resource`
+    parameter is intentionally dropped (Entra v2 uses scopes, not resource).
+-->
+<policies>
+    <inbound>
+        <return-response>
+            <set-status code="302" reason="Found" />
+            <set-header name="Location" exists-action="override">
+                <value><![CDATA[@{
+                    var q = context.Request.OriginalUrl.Query;
+                    var tenant = "${tenant_id}";
+                    var clientId = "${mcp_client_id}";
+                    var scope = System.Uri.EscapeDataString("${oauth_scope} openid offline_access");
+                    // Query values from OriginalUrl are already percent-encoded; pass them through raw.
+                    var redirectUri = q.GetValueOrDefault("redirect_uri", "");
+                    var state = q.GetValueOrDefault("state", "");
+                    var challenge = q.GetValueOrDefault("code_challenge", "");
+                    var method = q.GetValueOrDefault("code_challenge_method", "S256");
+                    return "https://login.microsoftonline.com/" + tenant + "/oauth2/v2.0/authorize"
+                        + "?client_id=" + clientId
+                        + "&response_type=code"
+                        + "&response_mode=query"
+                        + "&redirect_uri=" + redirectUri
+                        + "&scope=" + scope
+                        + "&state=" + state
+                        + "&code_challenge=" + challenge
+                        + "&code_challenge_method=" + method;
+                }]]></value>
+            </set-header>
+        </return-response>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

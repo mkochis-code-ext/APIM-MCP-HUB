@@ -1,0 +1,30 @@
+<!--
+    Shared CORS preflight handler for OPTIONS on the OAuth facade endpoints.
+    Returns 200 with permissive CORS headers so browser-originated discovery/registration
+    requests succeed.
+-->
+<policies>
+    <inbound>
+        <return-response>
+            <set-status code="200" reason="OK" />
+            <set-header name="Access-Control-Allow-Origin" exists-action="override">
+                <value>*</value>
+            </set-header>
+            <set-header name="Access-Control-Allow-Methods" exists-action="override">
+                <value>GET, POST, OPTIONS</value>
+            </set-header>
+            <set-header name="Access-Control-Allow-Headers" exists-action="override">
+                <value>*</value>
+            </set-header>
+        </return-response>
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>

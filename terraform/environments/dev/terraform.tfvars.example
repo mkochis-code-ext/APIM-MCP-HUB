@@ -1,0 +1,89 @@
+# Azure Subscription
+subscription_id = "00000000-0000-0000-0000-000000000000"
+
+# Environment Configuration
+environment_prefix = "dev"
+workload           = "apimobs"
+location           = "eastus2"
+data_location      = "" # Defaults to location if not specified
+
+# API Management
+publisher_name  = "MCP Observability Demo"
+publisher_email = "you@microsoft.com"
+# Developer_1 = cheapest MCP-capable tier (~30-45 min to provision, no SLA).
+# BasicV2_1   = provisions in minutes if you want to move faster (higher cost).
+apim_sku_name = "Developer_1"
+
+# ---------- Microsoft Entra ID (On-Behalf-Of authentication) ----------
+# Every caller authenticates with a Microsoft Entra ID token; APIM performs an
+# On-Behalf-Of exchange to mint a PER-USER Databricks token. Requires the two app
+# registrations + Databricks SCIM described in the README "Per-user identity (OBO)".
+#
+# EITHER let Terraform create the app registrations (recommended - the three IDs/secret
+# below are then ignored; only consent stays manual):
+create_entra_apps = true
+# OR create them manually and fill these in:
+entra_tenant_id   = "00000000-0000-0000-0000-000000000000" # Entra tenant GUID (always required)
+mcp_api_app_id    = ""                                     # API app (audience + OBO middle-tier; owns the secret + Databricks perm)
+mcp_client_app_id = ""                                     # VS Code public client app (loopback redirects)
+obo_client_secret = ""                                     # secret of mcp_api_app_id (prefer TF_VAR_obo_client_secret)
+obo_cache_seconds = 3000                                   # cache TTL for exchanged tokens (< token lifetime)
+
+# OAuth facade (PRM + authorize/token/register at the gateway root) - Terraform-managed
+oauth_facade_enabled = true
+
+# Grant GroupMember.Read.All to the APIM identity (needed by mcp_hub_graph_fallback).
+# Requires directory privileges on the deployer; leave false to grant manually.
+apim_graph_role_assignment_enabled = false
+
+# Per-user rate-limit (trip it live to show a 429)
+rate_limit_calls  = 5
+rate_limit_period = 30
+
+# Optional: provision a Databricks workspace too (Genie space is still manual)
+create_databricks_workspace = false
+
+# ---------- MCP Hub (single aggregated MCP endpoint - docs/mcp-hub-design.md section 12) ----------
+# One endpoint (<gateway>/mcp-hub/mcp) that merges the tool lists of the servers below,
+# filtered per caller by each server's ACL entries. Max 3 persona entries per server.
+# match_type: "role" (Entra app role value), "group" (Entra group OBJECT GUID),
+# "scope" (client-app scope - a client-tier gate, NOT per-user entitlement), or "any".
+# allow: tool names, or ["*"] for everything; deny: carve-outs (deny always wins).
+# No matching entry => that server is invisible to the caller and every call is denied.
+mcp_hub_enabled             = false # flip to true to deploy the hub
+mcp_hub_path                = "mcp-hub"
+mcp_hub_tools_cache_seconds = 120
+
+mcp_hub_servers = {
+  dbx = {
+    backend_url = "https://adb-0000000000000000.0.azuredatabricks.net/api/2.0/mcp/genie/<space-id>"
+    auth        = "obo"
+    obo_scope   = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default" # well-known Azure Databricks app
+    acl = [
+      { match_type = "role", match_value = "Databricks.Analyst", allow = ["query_genie", "list_spaces"] },
+      { match_type = "group", match_value = "33333333-3333-3333-3333-333333333333", allow = ["*"], deny = ["create_dashboard"] },
+      { match_type = "role", match_value = "Databricks.Admin", allow = ["*"] },
+    ]
+  }
+  foundry = {
+    backend_url = "https://mcp.ai.azure.com/"
+    auth        = "obo"
+    obo_scope   = "https://mcp.ai.azure.com/.default"
+    acl = [
+      { match_type = "role", match_value = "Foundry.User", allow = ["*"] },
+    ]
+  }
+  learn = {
+    backend_url = "https://learn.microsoft.com/api/mcp"
+    auth        = "none"
+    acl = [
+      { match_type = "any", allow = ["*"] },
+    ]
+  }
+}
+
+# Tags
+tags = {
+  Project = "APIM MCP Observability Demo"
+  Owner   = "Developer Name"
+}

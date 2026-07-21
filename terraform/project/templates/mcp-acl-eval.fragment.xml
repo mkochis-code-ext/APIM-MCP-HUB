@@ -1,0 +1,103 @@
+<!--
+  Shared ACL evaluation fragment (mcp-acl-eval), included by every per-server MCP
+  policy via <include-fragment>. Exists ONCE so the group/Graph-fallback logic is
+  not duplicated across N server policies.
+
+  CONTRACT - the including policy MUST set these variables BEFORE the include:
+    jwt       (Jwt)     validated caller token
+    callerOid (string)  caller object id (cache key for the Graph fallback)
+    aclJson   (string)  the server's mcp-acl-<name> named value content
+                        (single-quoted JSON: { backend, path, acl: [entries] })
+
+  Variables produced:
+    effectiveGroups (string) JSON array of group GUIDs: token claims + Graph-verified
+    aclResult       (string) compact JSON { matched:[idx], all:bool, allow:[], deny:[] }
+                             matched == [] => default deny (server invisible / calls refused)
+
+  Graph fallback (toggle: mcp-hub-graph-fallback named value): group ACL entries not
+  satisfied by the token's groups claim (missing claim, overage, nested membership) are
+  verified via checkMemberGroups (transitive; max 20 ids), cached per user for 300s.
+  Requires GroupMember.Read.All on the APIM managed identity; failures silently fall
+  back to claims-only.
+-->
+<fragment>
+  <set-variable name="pendingGroups" value="@{
+      var cand = new System.Collections.Generic.HashSet&lt;string&gt;(StringComparer.OrdinalIgnoreCase);
+      var cfg = JObject.Parse((string)context.Variables[&quot;aclJson&quot;]);
+      foreach (var e in (JArray)(cfg[&quot;acl&quot;] ?? new JArray())) {
+          if ((string)e[&quot;match&quot;][&quot;type&quot;] == &quot;group&quot;) { cand.Add((string)e[&quot;match&quot;][&quot;value&quot;]); }
+      }
+      var jwt = (Jwt)context.Variables[&quot;jwt&quot;];
+      var claimGroups = jwt.Claims.ContainsKey(&quot;groups&quot;) ? jwt.Claims[&quot;groups&quot;] : new string[0];
+      foreach (var g in claimGroups) { cand.Remove(g); }
+      return new JArray(cand.Take(20)).ToString(Newtonsoft.Json.Formatting.None);
+  }" />
+  <choose>
+    <when condition="@(&quot;{{mcp-hub-graph-fallback}}&quot; == &quot;true&quot; &amp;&amp; JArray.Parse((string)context.Variables[&quot;pendingGroups&quot;]).Count &gt; 0)">
+      <cache-lookup-value key="@(&quot;graph-groups-&quot; + (string)context.Variables[&quot;callerOid&quot;])" variable-name="graphGroups" />
+      <choose>
+        <when condition="@(!context.Variables.ContainsKey(&quot;graphGroups&quot;))">
+          <!-- Resource string = Graph's app-id GUID (a valid audience form). APIM caches
+               MI tokens per resource STRING until expiry (~24h), so a token acquired
+               before an app role grant lacks the role until it expires. When granting
+               new Graph roles, rotate this string to an equivalent variant
+               (https://graph.microsoft.com, trailing-slash form, or the GUID) to force
+               a fresh token. Needs GroupMember.Read.All + User.ReadBasic.All. -->
+          <authentication-managed-identity resource="00000003-0000-0000-c000-000000000000" output-token-variable-name="graphToken" ignore-error="true" />
+          <choose>
+            <when condition="@(context.Variables.ContainsKey(&quot;graphToken&quot;))">
+              <send-request mode="new" response-variable-name="graphResp" timeout="10" ignore-error="true">
+                <set-url>@("https://graph.microsoft.com/v1.0/users/" + (string)context.Variables["callerOid"] + "/checkMemberGroups")</set-url>
+                <set-method>POST</set-method>
+                <set-header name="Authorization" exists-action="override">
+                  <value>@("Bearer " + (string)context.Variables["graphToken"])</value>
+                </set-header>
+                <set-header name="Content-Type" exists-action="override">
+                  <value>application/json</value>
+                </set-header>
+                <set-body>@("{\"groupIds\":" + (string)context.Variables["pendingGroups"] + "}")</set-body>
+              </send-request>
+              <choose>
+                <when condition="@(context.Variables.ContainsKey(&quot;graphResp&quot;) &amp;&amp; context.Variables[&quot;graphResp&quot;] != null &amp;&amp; ((IResponse)context.Variables[&quot;graphResp&quot;]).StatusCode &lt; 400)">
+                  <set-variable name="graphGroups" value="@(((JArray)(JObject.Parse(((IResponse)context.Variables[&quot;graphResp&quot;]).Body.As&lt;string&gt;(preserveContent: true))[&quot;value&quot;] ?? new JArray())).ToString(Newtonsoft.Json.Formatting.None))" />
+                  <cache-store-value key="@(&quot;graph-groups-&quot; + (string)context.Variables[&quot;callerOid&quot;])" value="@((string)context.Variables[&quot;graphGroups&quot;])" duration="300" />
+                </when>
+              </choose>
+            </when>
+          </choose>
+        </when>
+      </choose>
+    </when>
+  </choose>
+  <set-variable name="effectiveGroups" value="@{
+      var set = new System.Collections.Generic.HashSet&lt;string&gt;(StringComparer.OrdinalIgnoreCase);
+      var jwt = (Jwt)context.Variables[&quot;jwt&quot;];
+      if (jwt.Claims.ContainsKey(&quot;groups&quot;)) { foreach (var g in jwt.Claims[&quot;groups&quot;]) { set.Add(g); } }
+      if (context.Variables.ContainsKey(&quot;graphGroups&quot;)) { foreach (var t in JArray.Parse((string)context.Variables[&quot;graphGroups&quot;])) { set.Add((string)t); } }
+      return new JArray(set).ToString(Newtonsoft.Json.Formatting.None);
+  }" />
+  <set-variable name="aclResult" value="@{
+      var cfg    = JObject.Parse((string)context.Variables[&quot;aclJson&quot;]);
+      var jwt    = (Jwt)context.Variables[&quot;jwt&quot;];
+      var roles  = jwt.Claims.ContainsKey(&quot;roles&quot;)  ? jwt.Claims[&quot;roles&quot;]  : new string[0];
+      var groups = JArray.Parse((string)context.Variables[&quot;effectiveGroups&quot;]).Select(t =&gt; (string)t).ToArray();
+      var scopes = (jwt.Claims.ContainsKey(&quot;scp&quot;) ? string.Join(&quot; &quot;, jwt.Claims[&quot;scp&quot;]) : &quot;&quot;).Split(' ');
+      var matched = new JArray(); var allow = new JArray(); var deny = new JArray(); var all = false; var i = 0;
+      foreach (var e in (JArray)(cfg[&quot;acl&quot;] ?? new JArray())) {
+          var mt = (string)e[&quot;match&quot;][&quot;type&quot;]; var mv = (string)e[&quot;match&quot;][&quot;value&quot;];
+          var hit = (mt == &quot;any&quot;)
+                 || (mt == &quot;role&quot;  &amp;&amp; roles.Contains(mv, StringComparer.OrdinalIgnoreCase))
+                 || (mt == &quot;group&quot; &amp;&amp; groups.Contains(mv, StringComparer.OrdinalIgnoreCase))
+                 || (mt == &quot;scope&quot; &amp;&amp; scopes.Contains(mv, StringComparer.OrdinalIgnoreCase));
+          if (hit) {
+              matched.Add(i);
+              var a = e[&quot;allow&quot;];
+              if (a != null &amp;&amp; a.Type == JTokenType.String &amp;&amp; (string)a == &quot;all&quot;) { all = true; }
+              else if (a != null) { foreach (var t in (JArray)a) { allow.Add((string)t); } }
+              if (e[&quot;deny&quot;] != null) { foreach (var t in (JArray)e[&quot;deny&quot;]) { deny.Add((string)t); } }
+          }
+          i++;
+      }
+      return new JObject { [&quot;matched&quot;] = matched, [&quot;all&quot;] = all, [&quot;allow&quot;] = allow, [&quot;deny&quot;] = deny }.ToString(Newtonsoft.Json.Formatting.None);
+  }" />
+</fragment>

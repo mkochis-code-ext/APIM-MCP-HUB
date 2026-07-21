@@ -1,0 +1,296 @@
+<!--
+  Per-server MCP policy (attached to a NATIVE MCP-type API). Pure control flow -
+  all debug tracing lives in the mcp-debug-* policy fragments (one-line includes),
+  and ACL evaluation in the shared ${acl_fragment_id} fragment.
+
+  MCP-type constraint: never read context.Response.Body (buffering breaks the MCP
+  streaming pipeline). Moreover, the native MCP pipeline requires a platform-managed
+  session established by an initialize that flows THROUGH it - but the hub answers
+  initialize locally, so sessionless forwards die in forward-request with a 500
+  ("Value cannot be null (Parameter 'source')"). Therefore BOTH tools/list and
+  tools/call are answered entirely inbound via send-request; the native pipeline is
+  never exercised (the MCP API type is kept for portal visibility/registry).
+
+  Flow: hub-only gate -> validate token (both audience forms) -> ACL eval ->
+    tools/list  : no match -> 403 (hub drops); else fetch backend catalog, filter,
+                  cache per ACL outcome (${tools_cache_seconds}s), return bare names
+    tools/call  : denied tool -> JSON-RPC -32602; optional per-user rate limit;
+                  OBO-or-strip auth; inbound send-request to the backend (SSE-framed
+                  responses unwrapped to the final JSON-RPC message)
+    otherwise   : -32601 (the hub answers initialize/ping/notifications)
+
+  Auth mode: ${auth}. OBO tokens cached under "${server_name}-obo-<oid>" for
+  ${obo_cache_seconds}s. The mcp-acl-${server_name} named value holds single-quoted
+  JSON; ACL edits propagate in ~30s with no policy redeploy.
+-->
+<policies>
+  <inbound>
+    <base />
+    <set-variable name="mcpServer" value="${server_name}" />
+    <!-- Hub-only gate -->
+    <choose>
+      <when condition="@(context.Request.Headers.GetValueOrDefault(&quot;X-MCP-Internal-Key&quot;, &quot;&quot;) != &quot;{{mcp-hub-internal-key}}&quot;)">
+        <return-response>
+          <set-status code="401" reason="Unauthorized" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"statusCode":401,"message":"This endpoint is only reachable through the MCP hub."}</set-body>
+        </return-response>
+      </when>
+    </choose>
+    <!-- Validate the forwarded user token (defense in depth; also the OBO assertion).
+         v1 tokens use api://<app-id> as audience; v2 tokens the bare GUID. -->
+    <validate-azure-ad-token tenant-id="${entra_tenant_id}" header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="Unauthorized. A valid Microsoft Entra ID access token is required." output-token-variable-name="jwt">
+      ${client_app_ids_xml}
+      <audiences>
+        <audience>api://${mcp_api_app_id}</audience>
+        <audience>${mcp_api_app_id}</audience>
+      </audiences>
+    </validate-azure-ad-token>
+    <set-variable name="callerOid" value="@(((Jwt)context.Variables[&quot;jwt&quot;]).Claims.GetValueOrDefault(&quot;oid&quot;, &quot;unknown&quot;))" />
+
+    <!-- Parse the JSON-RPC envelope -->
+    <set-variable name="rpcBody" value="@(context.Request.Body.As&lt;JObject&gt;(preserveContent: true))" />
+    <set-variable name="rpcMethod" value="@((string)((JObject)context.Variables[&quot;rpcBody&quot;])[&quot;method&quot;] ?? &quot;&quot;)" />
+    <set-variable name="rpcId" value="@((((JObject)context.Variables[&quot;rpcBody&quot;])[&quot;id&quot;] ?? JValue.CreateNull()).ToString(Newtonsoft.Json.Formatting.None))" />
+
+    <!-- ACL evaluation (shared fragment: groups claim + Graph fallback + entry matching) -->
+    <set-variable name="aclJson" value="@(@&quot;{{mcp-acl-${server_name}}}&quot;)" />
+    <include-fragment fragment-id="${acl_fragment_id}" />
+    <include-fragment fragment-id="mcp-debug-acl" />
+
+%{ if auth == "obo" ~}
+    <!-- OBO exchange (needed by tools/list's send-request AND tools/call's forward) -->
+    <choose>
+      <when condition="@(JObject.Parse((string)context.Variables[&quot;aclResult&quot;])[&quot;matched&quot;].HasValues &amp;&amp; ((string)context.Variables[&quot;rpcMethod&quot;] == &quot;tools/list&quot; || (string)context.Variables[&quot;rpcMethod&quot;] == &quot;tools/call&quot;))">
+        <cache-lookup-value key="@(&quot;${server_name}-obo-&quot; + (string)context.Variables[&quot;callerOid&quot;])" variable-name="backendToken" />
+        <choose>
+          <when condition="@(!context.Variables.ContainsKey(&quot;backendToken&quot;))">
+            <send-request mode="new" response-variable-name="oboResp" timeout="20" ignore-error="false">
+              <set-url>https://login.microsoftonline.com/${entra_tenant_id}/oauth2/v2.0/token</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/x-www-form-urlencoded</value>
+              </set-header>
+              <set-body>@("client_id=${mcp_api_app_id}" + "&amp;client_secret=" + System.Uri.EscapeDataString("{{${obo_secret_named_value}}}") + "&amp;grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" + "&amp;assertion=" + System.Uri.EscapeDataString(context.Request.Headers.GetValueOrDefault("Authorization","").Replace("Bearer ","")) + "&amp;scope=${obo_scope}" + "&amp;requested_token_use=on_behalf_of")</set-body>
+            </send-request>
+            <choose>
+              <when condition="@(((IResponse)context.Variables[&quot;oboResp&quot;]).StatusCode &gt;= 400)">
+                <include-fragment fragment-id="mcp-debug-obo" />
+                <return-response>
+                  <set-status code="502" reason="OBO exchange failed" />
+                  <set-header name="Content-Type" exists-action="override">
+                    <value>application/json</value>
+                  </set-header>
+                  <set-body>@(((IResponse)context.Variables["oboResp"]).Body.As&lt;string&gt;(preserveContent: true))</set-body>
+                </return-response>
+              </when>
+            </choose>
+            <set-variable name="backendToken" value="@((string)JObject.Parse(((IResponse)context.Variables[&quot;oboResp&quot;]).Body.As&lt;string&gt;(preserveContent: true))[&quot;access_token&quot;])" />
+            <cache-store-value key="@(&quot;${server_name}-obo-&quot; + (string)context.Variables[&quot;callerOid&quot;])" value="@((string)context.Variables[&quot;backendToken&quot;])" duration="${obo_cache_seconds}" />
+          </when>
+        </choose>
+      </when>
+    </choose>
+%{ endif ~}
+    <choose>
+      <!-- ============ tools/list: answered entirely inbound ============ -->
+      <when condition="@((string)context.Variables[&quot;rpcMethod&quot;] == &quot;tools/list&quot;)">
+        <!-- No ACL match => 403; the hub's fan-out drops >=400 (default deny). -->
+        <choose>
+          <when condition="@(!JObject.Parse((string)context.Variables[&quot;aclResult&quot;])[&quot;matched&quot;].HasValues)">
+            <return-response>
+              <set-status code="403" reason="Forbidden" />
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>@("{\"jsonrpc\":\"2.0\",\"id\":" + (string)context.Variables["rpcId"] + ",\"error\":{\"code\":-32602,\"message\":\"No entitlement for this MCP server\"}}")</set-body>
+            </return-response>
+          </when>
+        </choose>
+        <!-- Filtered-list cache per ACL outcome (FNV-1a; ACL edits invalidate immediately) -->
+        <set-variable name="toolsCacheKey" value="@{
+            var s = (string)context.Variables[&quot;aclResult&quot;];
+            uint h = 2166136261;
+            foreach (var c in s) { h = (h ^ (uint)c) * 16777619; }
+            return &quot;${server_name}-tools-&quot; + h;
+        }" />
+        <cache-lookup-value key="@((string)context.Variables[&quot;toolsCacheKey&quot;])" variable-name="cachedTools" />
+        <choose>
+          <when condition="@(!context.Variables.ContainsKey(&quot;cachedTools&quot;))">
+            <!-- Fetch the backend catalog (SSE-framed single responses unwrapped), filter, cache -->
+            <send-request mode="new" response-variable-name="listResp" timeout="15" ignore-error="false">
+              <set-url>${backend_url}</set-url>
+              <set-method>POST</set-method>
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-header name="Accept" exists-action="override">
+                <value>application/json, text/event-stream</value>
+              </set-header>
+%{ if auth == "obo" ~}
+              <set-header name="Authorization" exists-action="override">
+                <value>@("Bearer " + (string)context.Variables["backendToken"])</value>
+              </set-header>
+%{ endif ~}
+              <set-body>{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}</set-body>
+            </send-request>
+            <set-variable name="cachedTools" value="@{
+                var r = (IResponse)context.Variables[&quot;listResp&quot;];
+                if (r == null || r.StatusCode &gt;= 400) { return &quot;[]&quot;; }
+                var raw = r.Body.As&lt;string&gt;(preserveContent: true) ?? &quot;&quot;;
+                if (raw.Contains(&quot;data:&quot;) &amp;&amp; !raw.TrimStart().StartsWith(&quot;{&quot;)) {
+                    var sb = new System.Text.StringBuilder();
+                    foreach (var line in raw.Split('\n')) { if (line.StartsWith(&quot;data:&quot;)) { sb.Append(line.Substring(5).Trim()); } }
+                    raw = sb.ToString();
+                }
+                JObject parsed = null;
+                try { parsed = JObject.Parse(raw); } catch (Exception) { return &quot;[]&quot;; }
+                var tools = parsed[&quot;result&quot;]?[&quot;tools&quot;] as JArray; if (tools == null) { return &quot;[]&quot;; }
+                var acl = JObject.Parse((string)context.Variables[&quot;aclResult&quot;]);
+                var all = (bool)acl[&quot;all&quot;];
+                var allow = ((JArray)acl[&quot;allow&quot;]).Select(t =&gt; (string)t).ToArray();
+                var deny  = ((JArray)acl[&quot;deny&quot;]).Select(t =&gt; (string)t).ToArray();
+                var kept = new JArray();
+                foreach (var t in tools) {
+                    var toolName = (string)t[&quot;name&quot;];
+                    if (deny.Contains(toolName, StringComparer.OrdinalIgnoreCase)) { continue; }
+                    if (!all &amp;&amp; !allow.Contains(toolName, StringComparer.OrdinalIgnoreCase)) { continue; }
+                    kept.Add(t.DeepClone());
+                }
+                return kept.ToString(Newtonsoft.Json.Formatting.None);
+            }" />
+            <cache-store-value key="@((string)context.Variables[&quot;toolsCacheKey&quot;])" value="@((string)context.Variables[&quot;cachedTools&quot;])" duration="${tools_cache_seconds}" />
+          </when>
+        </choose>
+        <return-response>
+          <set-status code="200" reason="OK" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>@("{\"jsonrpc\":\"2.0\",\"id\":" + (string)context.Variables["rpcId"] + ",\"result\":{\"tools\":" + (string)context.Variables["cachedTools"] + "}}")</set-body>
+        </return-response>
+      </when>
+
+      <!-- ============ tools/call ============ -->
+      <when condition="@((string)context.Variables[&quot;rpcMethod&quot;] == &quot;tools/call&quot;)">
+        <set-variable name="targetTool" value="@((string)(((JObject)context.Variables[&quot;rpcBody&quot;])[&quot;params&quot;]?[&quot;name&quot;]) ?? &quot;&quot;)" />
+        <!-- Call-time ACL check: list-hiding is UX, THIS is the control. -->
+        <set-variable name="callAllowed" value="@{
+            var acl  = JObject.Parse((string)context.Variables[&quot;aclResult&quot;]);
+            var tool = (string)context.Variables[&quot;targetTool&quot;];
+            if (!acl[&quot;matched&quot;].HasValues) { return &quot;false&quot;; }
+            if (((JArray)acl[&quot;deny&quot;]).Select(t =&gt; (string)t).Contains(tool, StringComparer.OrdinalIgnoreCase)) { return &quot;false&quot;; }
+            if ((bool)acl[&quot;all&quot;]) { return &quot;true&quot;; }
+            return ((JArray)acl[&quot;allow&quot;]).Select(t =&gt; (string)t).Contains(tool, StringComparer.OrdinalIgnoreCase) ? &quot;true&quot; : &quot;false&quot;;
+        }" />
+        <choose>
+          <when condition="@((string)context.Variables[&quot;callAllowed&quot;] != &quot;true&quot;)">
+            <!-- Audit trail (always on): denied calls are otherwise invisible -->
+            <trace source="MCP" severity="information">
+              <message>MCP server tools/call denied</message>
+              <metadata name="mcp-server" value="${server_name}" />
+              <metadata name="tool" value="@((string)context.Variables[&quot;targetTool&quot;])" />
+              <metadata name="decision" value="denied" />
+              <metadata name="caller-oid" value="@((string)context.Variables[&quot;callerOid&quot;])" />
+            </trace>
+            <return-response>
+              <set-status code="200" reason="OK" />
+              <set-header name="Content-Type" exists-action="override">
+                <value>application/json</value>
+              </set-header>
+              <set-body>@("{\"jsonrpc\":\"2.0\",\"id\":" + (string)context.Variables["rpcId"] + ",\"error\":{\"code\":-32602,\"message\":\"Unknown or unauthorized tool: " + (string)context.Variables["targetTool"] + "\"}}")</set-body>
+            </return-response>
+          </when>
+        </choose>
+%{ if rate_limit_calls != null ~}
+        <!-- Per-user rate limit, counted AFTER the ACL check (denied probes don't consume quota) -->
+        <rate-limit-by-key calls="${rate_limit_calls}" renewal-period="${rate_limit_period}" counter-key="@(&quot;${server_name}-rl-&quot; + (string)context.Variables[&quot;callerOid&quot;])" />
+%{ endif ~}
+        <!-- Attribution trace (always on): consumed by the observability workbook -->
+        <trace source="MCP" severity="information">
+          <message>MCP tool call through APIM (OBO)</message>
+          <metadata name="mcp-server" value="${server_name}" />
+          <metadata name="tool" value="@((string)context.Variables[&quot;targetTool&quot;])" />
+          <metadata name="decision" value="allowed" />
+          <metadata name="caller-oid" value="@((string)context.Variables[&quot;callerOid&quot;])" />
+          <metadata name="caller-upn" value="@(((Jwt)context.Variables[&quot;jwt&quot;]).Claims.GetValueOrDefault(&quot;preferred_username&quot;, ((Jwt)context.Variables[&quot;jwt&quot;]).Claims.GetValueOrDefault(&quot;upn&quot;, ((Jwt)context.Variables[&quot;jwt&quot;]).Claims.GetValueOrDefault(&quot;name&quot;, (string)context.Variables[&quot;callerOid&quot;]))))" />
+          <metadata name="request-body" value="@(((JObject)context.Variables[&quot;rpcBody&quot;]).ToString(Newtonsoft.Json.Formatting.None))" />
+        </trace>
+        <!-- Forward inbound (never the native pipeline - see header). Headers are
+             built from scratch: internal key never leaks, auth is OBO-or-absent. -->
+        <send-request mode="new" response-variable-name="callResp" timeout="120" ignore-error="true">
+          <set-url>${backend_url}</set-url>
+          <set-method>POST</set-method>
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-header name="Accept" exists-action="override">
+            <value>application/json, text/event-stream</value>
+          </set-header>
+%{ if auth == "obo" ~}
+          <set-header name="Authorization" exists-action="override">
+            <value>@("Bearer " + (string)context.Variables["backendToken"])</value>
+          </set-header>
+%{ endif ~}
+          <set-body>@(((JObject)context.Variables["rpcBody"]).ToString(Newtonsoft.Json.Formatting.None))</set-body>
+        </send-request>
+        <return-response>
+          <set-status code="200" reason="OK" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>@{
+              var id = (string)context.Variables["rpcId"];
+              var r = context.Variables.ContainsKey("callResp") ? (IResponse)context.Variables["callResp"] : null;
+              if (r == null) { return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":-32603,\"message\":\"Backend MCP server did not respond\"}}"; }
+              var raw = r.Body.As&lt;string&gt;(preserveContent: true) ?? "";
+              if (r.StatusCode &gt;= 400) {
+                  var detail = raw.Length &gt; 300 ? raw.Substring(0, 300) : raw;
+                  return new JObject { ["jsonrpc"] = "2.0", ["id"] = JToken.Parse(id), ["error"] = new JObject { ["code"] = -32603, ["message"] = "Backend MCP server returned HTTP " + r.StatusCode + ": " + detail } }.ToString(Newtonsoft.Json.Formatting.None);
+              }
+              if (!raw.TrimStart().StartsWith("{")) {
+                  // SSE-framed: events split on blank lines, each event's data: lines
+                  // concatenated; keep the LAST event carrying a result or error (progress
+                  // notifications precede the final response).
+                  string final = null;
+                  foreach (var evt in raw.Replace("\r\n", "\n").Split(new[] { "\n\n" }, StringSplitOptions.RemoveEmptyEntries)) {
+                      var sb = new System.Text.StringBuilder();
+                      foreach (var line in evt.Split('\n')) { if (line.StartsWith("data:")) { sb.Append(line.Substring(5).Trim()); } }
+                      var candidate = sb.ToString();
+                      if (candidate.Length == 0) { continue; }
+                      try { var o = JObject.Parse(candidate); if (o["result"] != null || o["error"] != null) { final = candidate; } } catch (Exception) { }
+                  }
+                  if (final != null) { return final; }
+                  return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"error\":{\"code\":-32603,\"message\":\"Unparseable SSE response from backend MCP server\"}}";
+              }
+              return raw;
+          }</set-body>
+        </return-response>
+      </when>
+
+      <!-- ============ everything else: the hub answers initialize/ping/notifications ============ -->
+      <otherwise>
+        <return-response>
+          <set-status code="200" reason="OK" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>@("{\"jsonrpc\":\"2.0\",\"id\":" + (string)context.Variables["rpcId"] + ",\"error\":{\"code\":-32601,\"message\":\"Method not supported by this server endpoint\"}}")</set-body>
+        </return-response>
+      </otherwise>
+    </choose>
+  </inbound>
+  <backend>
+    <base />
+  </backend>
+  <outbound>
+    <!-- MCP-type API: response bodies are NEVER touched here (streaming). -->
+    <base />
+  </outbound>
+  <on-error>
+    <base />
+    <include-fragment fragment-id="mcp-debug-error" />
+  </on-error>
+</policies>

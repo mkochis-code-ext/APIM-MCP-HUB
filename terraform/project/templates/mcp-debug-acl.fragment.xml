@@ -1,0 +1,48 @@
+<!--
+  Debug fragment (mcp-debug-acl): per-request claim shape + Graph-fallback outcome +
+  ACL evaluation result, gated on the mcp-hub-debug named value. Included by every
+  per-server policy right after the mcp-acl-eval fragment.
+
+  CONTRACT - variables read (mcpServer set by the including policy; the rest are
+  produced by validate-azure-ad-token / mcp-acl-eval):
+    mcpServer, callerOid, rpcMethod, jwt, aclResult, pendingGroups,
+    graphToken? / graphResp? / graphGroups? (fallback internals, may be absent)
+
+  Counts and matched entry indices ONLY - never claim values, group GUIDs, or tokens.
+  graph-fallback values: off | not-needed | verified=N/M |
+  failed(token-acquisition) | failed(http-<code>) | failed(no-response).
+-->
+<fragment>
+  <choose>
+    <when condition="@(&quot;{{mcp-hub-debug}}&quot; == &quot;true&quot;)">
+      <trace source="MCP" severity="information">
+        <message>MCP server ACL evaluation (debug)</message>
+        <metadata name="mcp-server" value="@((string)context.Variables.GetValueOrDefault(&quot;mcpServer&quot;, &quot;unknown&quot;))" />
+        <metadata name="caller-oid" value="@((string)context.Variables[&quot;callerOid&quot;])" />
+        <metadata name="rpc-method" value="@((string)context.Variables[&quot;rpcMethod&quot;])" />
+        <metadata name="claims-shape" value="@{
+            var jwt = (Jwt)context.Variables[&quot;jwt&quot;];
+            var roles  = jwt.Claims.ContainsKey(&quot;roles&quot;)  ? jwt.Claims[&quot;roles&quot;].Length  : 0;
+            var groups = jwt.Claims.ContainsKey(&quot;groups&quot;) ? jwt.Claims[&quot;groups&quot;].Length : 0;
+            var scopes = jwt.Claims.ContainsKey(&quot;scp&quot;) ? string.Join(&quot; &quot;, jwt.Claims[&quot;scp&quot;]).Split(' ').Length : 0;
+            var overage = jwt.Claims.ContainsKey(&quot;_claim_names&quot;) ? &quot;yes&quot; : &quot;no&quot;;
+            return &quot;roles=&quot; + roles + &quot; groups=&quot; + groups + &quot; scopes=&quot; + scopes + &quot; groupsOverage=&quot; + overage;
+        }" />
+        <metadata name="graph-fallback" value="@{
+            if (&quot;{{mcp-hub-graph-fallback}}&quot; != &quot;true&quot;) { return &quot;off&quot;; }
+            if (JArray.Parse((string)context.Variables[&quot;pendingGroups&quot;]).Count == 0) { return &quot;not-needed&quot;; }
+            if (!context.Variables.ContainsKey(&quot;graphGroups&quot;)) {
+                if (!context.Variables.ContainsKey(&quot;graphToken&quot;)) { return &quot;failed(token-acquisition)&quot;; }
+                if (context.Variables.ContainsKey(&quot;graphResp&quot;) &amp;&amp; context.Variables[&quot;graphResp&quot;] != null) { return &quot;failed(http-&quot; + ((IResponse)context.Variables[&quot;graphResp&quot;]).StatusCode + &quot;)&quot;; }
+                return &quot;failed(no-response)&quot;;
+            }
+            return &quot;verified=&quot; + JArray.Parse((string)context.Variables[&quot;graphGroups&quot;]).Count + &quot;/&quot; + JArray.Parse((string)context.Variables[&quot;pendingGroups&quot;]).Count;
+        }" />
+        <metadata name="acl-result" value="@{
+            var a = JObject.Parse((string)context.Variables[&quot;aclResult&quot;]);
+            return &quot;matched=&quot; + a[&quot;matched&quot;].ToString(Newtonsoft.Json.Formatting.None) + &quot;,all=&quot; + (bool)a[&quot;all&quot;] + &quot;,allow#=&quot; + ((JArray)a[&quot;allow&quot;]).Count + &quot;,deny#=&quot; + ((JArray)a[&quot;deny&quot;]).Count;
+        }" />
+      </trace>
+    </when>
+  </choose>
+</fragment>

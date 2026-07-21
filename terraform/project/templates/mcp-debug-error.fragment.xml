@@ -1,0 +1,25 @@
+<!--
+  Debug fragment (mcp-debug-error): on-error trace, gated on the mcp-hub-debug
+  named value. Shared by the hub policy and every per-server policy.
+
+  CONTRACT - the including policy sets BEFORE the include (as its first inbound step,
+  so the variable exists whenever on-error fires):
+    mcpServer (string)  trace attribution ("hub" or the server key)
+
+  Emits error source/reason/message/status only - never tokens or headers.
+-->
+<fragment>
+  <choose>
+    <when condition="@(&quot;{{mcp-hub-debug}}&quot; == &quot;true&quot;)">
+      <trace source="MCP" severity="error">
+        <message>MCP request error</message>
+        <metadata name="mcp-server" value="@((string)context.Variables.GetValueOrDefault(&quot;mcpServer&quot;, &quot;unknown&quot;))" />
+        <metadata name="error-source" value="@(context.LastError?.Source ?? &quot;unknown&quot;)" />
+        <metadata name="error-reason" value="@(context.LastError?.Reason ?? &quot;unknown&quot;)" />
+        <metadata name="error-message" value="@(context.LastError?.Message ?? &quot;unknown&quot;)" />
+        <metadata name="status-code" value="@(context.Response != null ? context.Response.StatusCode.ToString() : &quot;n/a&quot;)" />
+        <metadata name="client-ip" value="@(context.Request.IpAddress ?? &quot;unknown&quot;)" />
+      </trace>
+    </when>
+  </choose>
+</fragment>

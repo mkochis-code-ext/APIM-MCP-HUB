@@ -1,0 +1,8 @@
+{
+  "servers": {
+    "mcp-hub-apim": {
+      "type": "http",
+      "url": "https://<apim-name>.azure-api.net/mcp-hub/mcp"
+    }
+  }
+}
