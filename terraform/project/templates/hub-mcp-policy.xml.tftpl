@@ -265,17 +265,7 @@
   </outbound>
   <on-error>
     <base />
-    <!-- Expired/invalid tokens fail validate-azure-ad-token into on-error; the MCP
-         auth spec requires the RFC 9728 resource_metadata challenge on EVERY 401
-         (not just the missing-header one above) so clients whose refresh token has
-         also lapsed can rediscover the authorization server and restart the flow. -->
-    <choose>
-      <when condition="@(context.LastError?.Source == &quot;validate-azure-ad-token&quot;)">
-        <set-header name="WWW-Authenticate" exists-action="override">
-          <value>Bearer error="invalid_token", resource_metadata="${gateway_url}/.well-known/oauth-protected-resource"</value>
-        </set-header>
-      </when>
-    </choose>
+    <!-- Note: validate-azure-ad-token returns 401 directly on validation failure; on-error is not invoked. -->
     <include-fragment fragment-id="mcp-debug-error" />
   </on-error>
 </policies>
