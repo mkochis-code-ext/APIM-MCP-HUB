@@ -8,8 +8,8 @@
     jwt       (Jwt)    validated caller token
     callerOid (string) caller's oid claim ("unknown" if absent)
 
-  Validation failure returns 401 and jumps to the including policy's on-error
-  section (context.LastError.Source == "validate-azure-ad-token").
+  Validation failure returns 401 immediately (failed-validation-httpcode) and does not execute
+  the including policy's on-error section.
 -->
 <fragment>
   <validate-azure-ad-token tenant-id="${entra_tenant_id}" header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="Unauthorized. A valid Microsoft Entra ID access token is required." output-token-variable-name="jwt">
