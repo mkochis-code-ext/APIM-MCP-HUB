@@ -19,5 +19,5 @@
       <audience>${mcp_api_app_id}</audience>
     </audiences>
   </validate-azure-ad-token>
-  <set-variable name="callerOid" value="@{ var claims = ((Jwt)context.Variables[&quot;jwt&quot;]).Claims; return claims.GetValueOrDefault(&quot;oid&quot;, claims.GetValueOrDefault(&quot;sub&quot;, claims.GetValueOrDefault(&quot;appid&quot;, &quot;unknown&quot;))); }" />
+  <set-variable name="callerOid" value="@{ var claims = ((Jwt)context.Variables[&quot;jwt&quot;]).Claims; return claims.GetValueOrDefault(&quot;oid&quot;, &quot;unknown&quot;); }" />
 </fragment>
