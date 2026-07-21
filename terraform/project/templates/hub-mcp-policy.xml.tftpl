@@ -52,7 +52,11 @@
     </choose>
     <!-- Shared token validation (mcp-validate-token fragment, also included by every
          per-server policy): tenant + both audience forms; sets jwt + callerOid. -->
+    <set-header name="WWW-Authenticate" exists-action="override">
+      <value>Bearer error="invalid_token", resource_metadata="${gateway_url}/.well-known/oauth-protected-resource"</value>
+    </set-header>
     <include-fragment fragment-id="mcp-validate-token" />
+    <set-header name="WWW-Authenticate" exists-action="delete" />
     <rate-limit-by-key calls="${rate_limit_calls}" renewal-period="${rate_limit_period}" counter-key="@((string)context.Variables[&quot;callerOid&quot;])" remaining-calls-variable-name="remainingCallsPerUser" />
 
     <!-- Parse the JSON-RPC envelope once -->
