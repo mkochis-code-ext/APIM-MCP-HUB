@@ -11,7 +11,8 @@
   tools/call are answered entirely inbound via send-request; the native pipeline is
   never exercised (the MCP API type is kept for portal visibility/registry).
 
-  Flow: hub-only gate -> validate token (both audience forms) -> ACL eval ->
+  Flow: hub-only gate -> validate token (shared mcp-validate-token fragment) ->
+    ACL eval (shared ${acl_fragment_id} fragment) ->
     tools/list  : no match -> 403 (hub drops); else fetch backend catalog, filter,
                   cache per ACL outcome (${tools_cache_seconds}s), return bare names
     tools/call  : denied tool -> JSON-RPC -32602; optional per-user rate limit;
@@ -19,9 +20,10 @@
                   responses unwrapped to the final JSON-RPC message)
     otherwise   : -32601 (the hub answers initialize/ping/notifications)
 
-  Auth mode: ${auth}. OBO tokens cached under "${server_name}-obo-<oid>" for
-  ${obo_cache_seconds}s. The mcp-acl-${server_name} named value holds single-quoted
-  JSON; ACL edits propagate in ~30s with no policy redeploy.
+  Auth mode: ${auth}. The OBO exchange is the shared mcp-obo-exchange fragment
+  (contract: oboScope set here; backendToken produced, cached per user). The
+  mcp-acl-${server_name} named value holds single-quoted JSON; ACL edits propagate
+  in ~30s with no policy redeploy.
 -->
 <policies>
   <inbound>
@@ -40,15 +42,8 @@
       </when>
     </choose>
     <!-- Validate the forwarded user token (defense in depth; also the OBO assertion).
-         v1 tokens use api://<app-id> as audience; v2 tokens the bare GUID. -->
-    <validate-azure-ad-token tenant-id="${entra_tenant_id}" header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="Unauthorized. A valid Microsoft Entra ID access token is required." output-token-variable-name="jwt">
-      ${client_app_ids_xml}
-      <audiences>
-        <audience>api://${mcp_api_app_id}</audience>
-        <audience>${mcp_api_app_id}</audience>
-      </audiences>
-    </validate-azure-ad-token>
-    <set-variable name="callerOid" value="@(((Jwt)context.Variables[&quot;jwt&quot;]).Claims.GetValueOrDefault(&quot;oid&quot;, &quot;unknown&quot;))" />
+         Shared mcp-validate-token fragment: sets jwt + callerOid. -->
+    <include-fragment fragment-id="mcp-validate-token" />
 
     <!-- Parse the JSON-RPC envelope -->
     <set-variable name="rpcBody" value="@(context.Request.Body.As&lt;JObject&gt;(preserveContent: true))" />
@@ -61,38 +56,10 @@
     <include-fragment fragment-id="mcp-debug-acl" />
 
 %{ if auth == "obo" ~}
-    <!-- OBO exchange (needed by tools/list's send-request AND tools/call's forward) -->
-    <choose>
-      <when condition="@(JObject.Parse((string)context.Variables[&quot;aclResult&quot;])[&quot;matched&quot;].HasValues &amp;&amp; ((string)context.Variables[&quot;rpcMethod&quot;] == &quot;tools/list&quot; || (string)context.Variables[&quot;rpcMethod&quot;] == &quot;tools/call&quot;))">
-        <cache-lookup-value key="@(&quot;${server_name}-obo-&quot; + (string)context.Variables[&quot;callerOid&quot;])" variable-name="backendToken" />
-        <choose>
-          <when condition="@(!context.Variables.ContainsKey(&quot;backendToken&quot;))">
-            <send-request mode="new" response-variable-name="oboResp" timeout="20" ignore-error="false">
-              <set-url>https://login.microsoftonline.com/${entra_tenant_id}/oauth2/v2.0/token</set-url>
-              <set-method>POST</set-method>
-              <set-header name="Content-Type" exists-action="override">
-                <value>application/x-www-form-urlencoded</value>
-              </set-header>
-              <set-body>@("client_id=${mcp_api_app_id}" + "&amp;client_secret=" + System.Uri.EscapeDataString("{{${obo_secret_named_value}}}") + "&amp;grant_type=urn:ietf:params:oauth:grant-type:jwt-bearer" + "&amp;assertion=" + System.Uri.EscapeDataString(context.Request.Headers.GetValueOrDefault("Authorization","").Replace("Bearer ","")) + "&amp;scope=${obo_scope}" + "&amp;requested_token_use=on_behalf_of")</set-body>
-            </send-request>
-            <choose>
-              <when condition="@(((IResponse)context.Variables[&quot;oboResp&quot;]).StatusCode &gt;= 400)">
-                <include-fragment fragment-id="mcp-debug-obo" />
-                <return-response>
-                  <set-status code="502" reason="OBO exchange failed" />
-                  <set-header name="Content-Type" exists-action="override">
-                    <value>application/json</value>
-                  </set-header>
-                  <set-body>@(((IResponse)context.Variables["oboResp"]).Body.As&lt;string&gt;(preserveContent: true))</set-body>
-                </return-response>
-              </when>
-            </choose>
-            <set-variable name="backendToken" value="@((string)JObject.Parse(((IResponse)context.Variables[&quot;oboResp&quot;]).Body.As&lt;string&gt;(preserveContent: true))[&quot;access_token&quot;])" />
-            <cache-store-value key="@(&quot;${server_name}-obo-&quot; + (string)context.Variables[&quot;callerOid&quot;])" value="@((string)context.Variables[&quot;backendToken&quot;])" duration="${obo_cache_seconds}" />
-          </when>
-        </choose>
-      </when>
-    </choose>
+    <!-- OBO exchange (shared mcp-obo-exchange fragment; produces backendToken for
+         tools/list's send-request AND tools/call's forward) -->
+    <set-variable name="oboScope" value="${obo_scope}" />
+    <include-fragment fragment-id="mcp-obo-exchange" />
 %{ endif ~}
     <choose>
       <!-- ============ tools/list: answered entirely inbound ============ -->

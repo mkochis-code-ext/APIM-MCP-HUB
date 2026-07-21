@@ -1,0 +1,23 @@
+<!--
+  Shared fragment (mcp-validate-token): Entra token validation used by the hub AND
+  every per-server policy - one source of truth so the two defense-in-depth layers
+  can never drift. v1 tokens carry api://<app-id> as audience; v2 tokens
+  (requested_access_token_version = 2) the bare GUID - both accepted.
+
+  CONTRACT - produces:
+    jwt       (Jwt)    validated caller token
+    callerOid (string) caller's oid claim ("unknown" if absent)
+
+  Validation failure returns 401 and jumps to the including policy's on-error
+  section (context.LastError.Source == "validate-azure-ad-token").
+-->
+<fragment>
+  <validate-azure-ad-token tenant-id="${entra_tenant_id}" header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="Unauthorized. A valid Microsoft Entra ID access token is required." output-token-variable-name="jwt">
+    ${client_app_ids_xml}
+    <audiences>
+      <audience>api://${mcp_api_app_id}</audience>
+      <audience>${mcp_api_app_id}</audience>
+    </audiences>
+  </validate-azure-ad-token>
+  <set-variable name="callerOid" value="@(((Jwt)context.Variables[&quot;jwt&quot;]).Claims.GetValueOrDefault(&quot;oid&quot;, &quot;unknown&quot;))" />
+</fragment>

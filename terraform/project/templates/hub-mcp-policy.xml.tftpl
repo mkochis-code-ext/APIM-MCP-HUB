@@ -19,9 +19,8 @@
   and each server API gets its own App Insights request telemetry.
 
   Template variables:
-    gateway_url, entra_tenant_id, client_app_ids_xml, mcp_api_app_id,
-    rate_limit_calls, rate_limit_period, tools_cache_seconds, servers_path_prefix,
-    server_names = set/list of server keys (prefixes)
+    gateway_url, rate_limit_calls, rate_limit_period, tools_cache_seconds,
+    servers_path_prefix, server_names = set/list of server keys (prefixes)
 -->
 <policies>
   <inbound>
@@ -51,15 +50,9 @@
         </return-response>
       </when>
     </choose>
-    <validate-azure-ad-token tenant-id="${entra_tenant_id}" header-name="Authorization" failed-validation-httpcode="401" failed-validation-error-message="Unauthorized. A valid Microsoft Entra ID access token is required." output-token-variable-name="jwt">
-      ${client_app_ids_xml}
-      <audiences>
-        <!-- v1 tokens use api://<app-id>; v2 tokens (requested_access_token_version = 2) use the bare GUID -->
-        <audience>api://${mcp_api_app_id}</audience>
-        <audience>${mcp_api_app_id}</audience>
-      </audiences>
-    </validate-azure-ad-token>
-    <set-variable name="callerOid" value="@(((Jwt)context.Variables[&quot;jwt&quot;]).Claims.GetValueOrDefault(&quot;oid&quot;, &quot;unknown&quot;))" />
+    <!-- Shared token validation (mcp-validate-token fragment, also included by every
+         per-server policy): tenant + both audience forms; sets jwt + callerOid. -->
+    <include-fragment fragment-id="mcp-validate-token" />
     <rate-limit-by-key calls="${rate_limit_calls}" renewal-period="${rate_limit_period}" counter-key="@((string)context.Variables[&quot;callerOid&quot;])" remaining-calls-variable-name="remainingCallsPerUser" />
 
     <!-- Parse the JSON-RPC envelope once -->
@@ -268,6 +261,17 @@
   </outbound>
   <on-error>
     <base />
+    <!-- Expired/invalid tokens fail validate-azure-ad-token into on-error; the MCP
+         auth spec requires the RFC 9728 resource_metadata challenge on EVERY 401
+         (not just the missing-header one above) so clients whose refresh token has
+         also lapsed can rediscover the authorization server and restart the flow. -->
+    <choose>
+      <when condition="@(context.LastError?.Source == &quot;validate-azure-ad-token&quot;)">
+        <set-header name="WWW-Authenticate" exists-action="override">
+          <value>Bearer error="invalid_token", resource_metadata="${gateway_url}/.well-known/oauth-protected-resource"</value>
+        </set-header>
+      </when>
+    </choose>
     <include-fragment fragment-id="mcp-debug-error" />
   </on-error>
 </policies>

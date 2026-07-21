@@ -457,9 +457,6 @@ locals {
 
   hub_policy_xml = templatefile("${path.module}/templates/hub-mcp-policy.xml.tftpl", {
     gateway_url         = local.gateway_url
-    entra_tenant_id     = var.entra_tenant_id
-    client_app_ids_xml  = local.client_app_ids_xml
-    mcp_api_app_id      = local.mcp_api_app_id
     rate_limit_calls    = var.rate_limit_calls
     rate_limit_period   = var.rate_limit_period
     tools_cache_seconds = var.mcp_hub_tools_cache_seconds
@@ -515,15 +512,41 @@ resource "azurerm_api_management_named_value" "mcp_hub_graph_fallback" {
   tags                = ["mcp-hub"]
 }
 
-# ---- Policy fragments: shared ACL evaluation + isolated debug tracing. Main
-# policies stay pure control flow with one-line <include-fragment> references.
-# All fragments reference the named values above, hence the depends_on. ----
+# ---- Policy fragments: shared token validation + ACL evaluation + OBO exchange +
+# isolated debug tracing. Main policies stay pure control flow with one-line
+# <include-fragment> references. Fragments reference the named values above (and
+# the OBO client secret), hence the depends_on. ----
 locals {
   mcp_policy_fragments = var.mcp_hub_enabled ? {
-    "mcp-acl-eval"    = "Shared MCP ACL evaluation: token claims + Graph checkMemberGroups fallback + persona entry matching"
-    "mcp-debug-acl"   = "Debug trace (mcp-hub-debug gated): claim shape + Graph fallback outcome + ACL result"
-    "mcp-debug-obo"   = "Debug trace (mcp-hub-debug gated): OBO exchange failure with the Entra AADSTS error body"
-    "mcp-debug-error" = "Debug trace (mcp-hub-debug gated): on-error source/reason/message, shared by hub + servers"
+    "mcp-validate-token" = {
+      description = "Shared Entra token validation (hub + servers): tenant + both audience forms; sets jwt + callerOid"
+      value = templatefile("${path.module}/templates/mcp-validate-token.fragment.xml.tftpl", {
+        entra_tenant_id    = var.entra_tenant_id
+        client_app_ids_xml = local.client_app_ids_xml
+        mcp_api_app_id     = local.mcp_api_app_id
+      })
+    }
+    "mcp-acl-eval" = {
+      description = "Shared MCP ACL evaluation: token claims + Graph checkMemberGroups fallback + persona entry matching"
+      value       = file("${path.module}/templates/mcp-acl-eval.fragment.xml")
+    }
+    "mcp-obo-exchange" = {
+      description = "Shared per-user OBO exchange: cache lookup + jwt-bearer exchange + failure trace/502 + cache store"
+      value = templatefile("${path.module}/templates/mcp-obo-exchange.fragment.xml.tftpl", {
+        entra_tenant_id        = var.entra_tenant_id
+        mcp_api_app_id         = local.mcp_api_app_id
+        obo_secret_named_value = local.obo_secret_named_value
+        obo_cache_seconds      = var.obo_cache_seconds
+      })
+    }
+    "mcp-debug-acl" = {
+      description = "Debug trace (mcp-hub-debug gated): claim shape + Graph fallback outcome + ACL result"
+      value       = file("${path.module}/templates/mcp-debug-acl.fragment.xml")
+    }
+    "mcp-debug-error" = {
+      description = "Debug trace (mcp-hub-debug gated): on-error source/reason/message, shared by hub + servers"
+      value       = file("${path.module}/templates/mcp-debug-error.fragment.xml")
+    }
   } : {}
 }
 
@@ -532,14 +555,15 @@ resource "azurerm_api_management_policy_fragment" "mcp" {
 
   api_management_id = module.api_management.id
   name              = each.key
-  description       = each.value
+  description       = each.value.description
   format            = "rawxml"
-  value             = file("${path.module}/templates/${each.key}.fragment.xml")
+  value             = each.value.value
 
   depends_on = [
     azurerm_api_management_named_value.mcp_hub_debug,
     azurerm_api_management_named_value.mcp_hub_graph_fallback,
     azurerm_api_management_named_value.mcp_hub_internal_key,
+    module.apim_named_value, # {{obo-client-secret}} referenced by mcp-obo-exchange
   ]
 }
 
@@ -562,8 +586,8 @@ module "mcp_hub" {
 # One NATIVE APIM MCP server (type = "mcp", preview RP via azapi - shows under
 # "MCP Servers" in the portal) per hub entry. Hub-only; owns ACL named value,
 # filtering, OBO, rate limit. Policies reference the shared named values
-# ({{mcp-hub-debug}}, {{mcp-hub-graph-fallback}}, {{mcp-hub-internal-key}},
-# {{obo-client-secret}}) and the mcp-acl-eval fragment - hence the depends_on.
+# ({{mcp-hub-debug}}, {{mcp-hub-internal-key}}) and the mcp-validate-token /
+# mcp-acl-eval / mcp-obo-exchange fragments - hence the depends_on.
 module "mcp_server" {
   source   = "../modules/azurerm/apim_mcp_server"
   for_each = var.mcp_hub_enabled ? var.mcp_hub_servers : {}
@@ -575,17 +599,11 @@ module "mcp_server" {
   api_management_id   = module.api_management.id
   backend_url         = each.value.backend_url
 
-  entra_tenant_id    = var.entra_tenant_id
-  client_app_ids_xml = local.client_app_ids_xml
-  mcp_api_app_id     = local.mcp_api_app_id
-
-  auth                   = each.value.auth
-  obo_scope              = each.value.obo_scope
-  obo_secret_named_value = local.obo_secret_named_value
-  obo_cache_seconds      = var.obo_cache_seconds
-  tools_cache_seconds    = var.mcp_hub_tools_cache_seconds
-  rate_limit_calls       = each.value.rate_limit_calls
-  rate_limit_period      = each.value.rate_limit_period
+  auth                = each.value.auth
+  obo_scope           = each.value.obo_scope
+  tools_cache_seconds = var.mcp_hub_tools_cache_seconds
+  rate_limit_calls    = each.value.rate_limit_calls
+  rate_limit_period   = each.value.rate_limit_period
 
   acl_value = local.hub_acl_values[each.key]
 
