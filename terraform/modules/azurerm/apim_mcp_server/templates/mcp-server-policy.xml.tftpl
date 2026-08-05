@@ -21,7 +21,9 @@
     otherwise   : -32601 (the hub answers initialize/ping/notifications)
 
   Auth mode: ${auth}. The OBO exchange is the shared mcp-obo-exchange fragment
-  (contract: oboScope set here; backendToken produced, cached per user). The
+  (contract: oboScope set here; backendToken produced, cached per user). "pat" fills
+  backendToken from the manually maintained {{mcp-pat-${server_name}}} OID->PAT map
+  instead (no entry => 403, server invisible to that caller). The
   mcp-acl-${server_name} named value holds single-quoted JSON; ACL edits propagate
   in ~30s with no policy redeploy.
 -->
@@ -61,6 +63,31 @@
     <set-variable name="oboScope" value="${obo_scope}" />
     <include-fragment fragment-id="mcp-obo-exchange" />
 %{ endif ~}
+%{ if auth == "pat" ~}
+    <!-- Per-user PAT lookup: {{mcp-pat-${server_name}}} is a manually maintained
+         single-quoted JSON map of caller OID -> backend PAT (Terraform only creates
+         the empty shell). No entry => 403: the hub's fan-out drops the server for
+         tools/list, so callers without a PAT never see its tools (default deny).
+         DEMO ONLY - production should use Key Vault-backed named values or a real
+         credential broker. -->
+    <set-variable name="backendToken" value="@{
+        try {
+            var pats = JObject.Parse(@&quot;{{mcp-pat-${server_name}}}&quot;);
+            return (string)pats[(string)context.Variables[&quot;callerOid&quot;]] ?? &quot;&quot;;
+        } catch (Exception) { return &quot;&quot;; }
+    }" />
+    <choose>
+      <when condition="@((string)context.Variables[&quot;backendToken&quot;] == &quot;&quot;)">
+        <return-response>
+          <set-status code="403" reason="Forbidden" />
+          <set-header name="Content-Type" exists-action="override">
+            <value>application/json</value>
+          </set-header>
+          <set-body>{"jsonrpc":"2.0","id":null,"error":{"code":-32602,"message":"No backend PAT registered for this caller (mcp-pat-${server_name})"}}</set-body>
+        </return-response>
+      </when>
+    </choose>
+%{ endif ~}
     <choose>
       <!-- ============ tools/list: answered entirely inbound ============ -->
       <when condition="@((string)context.Variables[&quot;rpcMethod&quot;] == &quot;tools/list&quot;)">
@@ -96,7 +123,7 @@
               <set-header name="Accept" exists-action="override">
                 <value>application/json, text/event-stream</value>
               </set-header>
-%{ if auth == "obo" ~}
+%{ if auth == "obo" || auth == "pat" ~}
               <set-header name="Authorization" exists-action="override">
                 <value>@("Bearer " + (string)context.Variables["backendToken"])</value>
               </set-header>
@@ -196,7 +223,7 @@
           <set-header name="Accept" exists-action="override">
             <value>application/json, text/event-stream</value>
           </set-header>
-%{ if auth == "obo" ~}
+%{ if auth == "obo" || auth == "pat" ~}
           <set-header name="Authorization" exists-action="override">
             <value>@("Bearer " + (string)context.Variables["backendToken"])</value>
           </set-header>

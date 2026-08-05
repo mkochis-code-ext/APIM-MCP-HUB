@@ -273,7 +273,16 @@ All permission legs need consent: client -> `mcp.tools`, and **App A -> each OBO
     ConvertTo-Json | Set-Content grant2.json
   az rest --method POST --url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" --body '@grant2.json' --headers "Content-Type=application/json"
 
-  Remove-Item grant1.json, grant2.json
+  # App A -> Azure Resource Manager MCP (only if the `arm` server is enabled in mcp_hub_servers).
+  # The ARM MCP first-party SP is NOT in the tenant by default - creating it also needs a directory admin:
+  az ad sp create --id 22bfbae3-f4e7-485f-be43-8cee15065084
+  $armSpId  = az ad sp show --id 22bfbae3-f4e7-485f-be43-8cee15065084 --query id -o tsv
+  $armScope = az ad sp show --id 22bfbae3-f4e7-485f-be43-8cee15065084 --query "oauth2PermissionScopes[0].value" -o tsv
+  @{ clientId = $apiSpId; consentType = "AllPrincipals"; resourceId = $armSpId; scope = $armScope } |
+    ConvertTo-Json | Set-Content grant3.json
+  az rest --method POST --url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" --body '@grant3.json' --headers "Content-Type=application/json"
+
+  Remove-Item grant1.json, grant2.json, grant3.json
   ```
   Creating `oauth2PermissionGrants` needs a **directory admin** (`Authorization_RequestDenied` means you aren't one). Verify with:
   ```powershell
@@ -660,6 +669,7 @@ mcp_hub_servers = {
 ```
 
 - **`auth = "obo"`** - the per-server policy performs the per-user OBO exchange against `obo_scope` before forwarding (scheme 1). Requires App A to be consented for the backend's delegated permission - see below.
+- **`auth = "pat"`** - for backends that don't accept Entra tokens (e.g. GitHub): the policy looks the caller's OID up in the **manually maintained** `mcp-pat-<key>` secret named-value map and forwards that PAT. Per-user identity is preserved at the backend, but this is a **demo pattern only** - see the GitHub example below.
 - **`auth = "none"`** - the backend is public; the per-server policy strips the `Authorization` header after validation (scheme 2). No app registration, secret, or consent involved (this is the Microsoft Learn entry).
 - **ACL edits alone** (changing `allow`/`deny` lists) only update the `mcp-acl-<key>` named value - ~30s propagation, no policy redeploy. **Granting a user** is just an Entra group-membership change.
 
@@ -696,6 +706,54 @@ Remove-Item grant.json
 If your tenant allows user consent, a non-admin can instead use the per-user variant (`consentType = "Principal"` + `principalId`) - **but only after** an admin has provisioned the SP with `az ad sp create` above.
 
 A `502` with `AADSTS65001` on a Foundry tool call - or the `foundry` server silently missing from `tools/list` (fan-out trace `foundry:502`) - means this consent hasn't been granted yet. The same pattern applies to any other Entra-protected backend: consent App A for the resource's delegated permission, add the map entry, apply.
+
+### OBO backend example: Azure Resource Manager MCP (preview; consent required, admin needed once)
+
+The shipped `arm` entry fronts the **[Azure Resource Manager MCP server](https://github.com/Azure/Azure-Resource-Manager-MCP)** (`https://mcp.management.azure.com`, preview) - Azure Resource Graph queries plus ARM template deployment tools, executed with the **caller's own Azure RBAC** (the OBO token preserves per-user authorization):
+
+| Parameter | Value |
+|---|---|
+| Resource app ID (OBO audience) | `22bfbae3-f4e7-485f-be43-8cee15065084` (well-known ARM MCP first-party app) |
+| `backend_url` | `https://mcp.management.azure.com/` |
+| `obo_scope` | `22bfbae3-f4e7-485f-be43-8cee15065084/.default` |
+
+Same two admin steps as Foundry - provision the first-party SP, then grant App A the delegated scope (the scope's `value` is read off the SP once it exists):
+
+```powershell
+# Admin: provision the ARM MCP resource SP in the tenant (not present by default)
+az ad sp create --id 22bfbae3-f4e7-485f-be43-8cee15065084
+
+$apiSpId  = az ad sp show --id <app-A> --query id -o tsv
+$armSpId  = az ad sp show --id 22bfbae3-f4e7-485f-be43-8cee15065084 --query id -o tsv
+$armScope = az ad sp show --id 22bfbae3-f4e7-485f-be43-8cee15065084 --query "oauth2PermissionScopes[0].value" -o tsv
+@{ clientId = $apiSpId; consentType = "AllPrincipals"; resourceId = $armSpId; scope = $armScope } |
+  ConvertTo-Json | Set-Content grant.json
+az rest --method POST --url "https://graph.microsoft.com/v1.0/oauth2PermissionGrants" --body '@grant.json' --headers "Content-Type=application/json"
+Remove-Item grant.json
+```
+
+> **Governance note:** the ARM MCP server includes a `create_template_deployment` tool that can deploy infrastructure. Constrain it with the hub ACL (`deny = ["create_template_deployment"]` on personas that should be read-only) and/or an Azure Policy that blocks deployments from the server's app ID - see [Blocking Template requests](https://github.com/Azure/Azure-Resource-Manager-MCP#blocking-template-requests).
+
+> **Availability note:** the server is in preview and officially supports a limited set of MCP clients; going through the hub, APIM is the client. If tool calls fail with client-validation errors despite correct consent, check the [ARM MCP FAQ](https://github.com/Azure/Azure-Resource-Manager-MCP/blob/main/docs/FAQ.md).
+
+### PAT backend example: GitHub MCP (demo pattern - manual per-user PAT map)
+
+The shipped `github` entry fronts the **[GitHub MCP server](https://github.com/github/github-mcp-server)** (`https://api.githubcopilot.com/mcp/`). GitHub authenticates with **GitHub credentials (PAT/OAuth), not Entra**, so the OBO exchange can't apply. Instead, `auth = "pat"` maps each caller to their own PAT:
+
+- Terraform creates the **secret named value `mcp-pat-github` with only the empty base structure (`{}`)** and `ignore_changes = [value]` - applies never read or overwrite the real value, and no PAT ever appears in code or plan output.
+- An operator registers users manually - the value is a **single-quoted** JSON map of Entra caller **object ID -> GitHub PAT**:
+
+  ```powershell
+  az apim nv update -g <rg> --service-name <apim> --named-value-id mcp-pat-github `
+    --value "{'<caller-object-id>':'github_pat_xxx','<other-caller-oid>':'github_pat_yyy'}"
+  ```
+
+- At request time the policy resolves the caller's OID in the map and forwards `Authorization: Bearer <their-PAT>`. **No entry => `403`** - the hub drops the server from that caller's `tools/list`, so users without a registered PAT never see GitHub tools (default deny, same UX as an unmatched ACL).
+- Each user's GitHub actions run under **their own** GitHub identity - scope PATs minimally (fine-grained, read-only where possible) and keep destructive tools in the ACL `deny` list.
+
+> **Demo pattern only.** Hand-edited named values are not a production credential store: no rotation, no expiry handling, PATs visible to anyone with APIM contributor rights, and the map lives in APIM (and the portal) as one blob. A production system should use Key Vault-backed named values at minimum, or a proper per-user credential broker / GitHub App installation flow.
+
+**Not hub-compatible (local-only, no hosted endpoint):** the [Azure MCP Server](https://github.com/microsoft/mcp/tree/main/servers/Azure.Mcp.Server), [Microsoft Fabric MCP](https://github.com/microsoft/mcp/tree/main/servers/Fabric.Mcp.Server), [Azure DevOps MCP](https://github.com/microsoft/azure-devops-mcp), and [MSSQL MCP](https://aka.ms/sql/mcp) servers are stdio/local-first per the [microsoft/mcp catalog](https://github.com/microsoft/mcp) - the hub can only front remote (streamable-HTTP) backends. They can be onboarded later if Microsoft ships hosted endpoints, or by self-hosting them behind an HTTP transport.
 
 ---
 

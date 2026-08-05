@@ -37,7 +37,7 @@ resource "azapi_resource" "server" {
     properties = {
       type                 = "mcp"
       displayName          = "MCP Server - ${var.server_name}"
-      description          = "Per-server MCP endpoint called by the hub: ACL evaluation + tool filtering + ${var.auth == "obo" ? "per-user OBO exchange" : "anonymous passthrough"} to the backend."
+      description          = "Per-server MCP endpoint called by the hub: ACL evaluation + tool filtering + ${var.auth == "obo" ? "per-user OBO exchange" : var.auth == "pat" ? "per-user PAT lookup (manual named-value map)" : "anonymous passthrough"} to the backend."
       path                 = "${var.path_prefix}/${var.server_name}"
       protocols            = ["https"]
       serviceUrl           = var.backend_url
@@ -65,6 +65,30 @@ resource "azurerm_api_management_named_value" "acl" {
   tags                = ["mcp-hub", "acl"]
 }
 
+# Per-user PAT map (auth = "pat" only): SECRET named value mcp-pat-<name> holding a
+# single-quoted JSON map of caller OID -> backend PAT, e.g. {'<oid>':'github_pat_...'}.
+# Terraform creates ONLY the empty base structure and never overwrites the value
+# (ignore_changes) - PATs are registered manually (portal, or az apim nv update).
+# A caller with no entry gets 403 and never sees this server's tools.
+# DEMO PATTERN ONLY: in production use Key Vault-backed named values or a real
+# credential broker with rotation - long-lived PATs in APIM named values are not
+# a production secret store.
+resource "azurerm_api_management_named_value" "pat_map" {
+  count = var.auth == "pat" ? 1 : 0
+
+  name                = "mcp-pat-${var.server_name}"
+  display_name        = "mcp-pat-${var.server_name}"
+  resource_group_name = var.resource_group_name
+  api_management_name = var.api_management_name
+  secret              = true
+  value               = "{}" # base structure only; real entries are set out-of-band
+  tags                = ["mcp-hub", "pat", "manual"]
+
+  lifecycle {
+    ignore_changes = [value]
+  }
+}
+
 locals {
   policy_xml = templatefile("${path.module}/templates/mcp-server-policy.xml.tftpl", {
     server_name         = var.server_name
@@ -86,5 +110,5 @@ resource "azurerm_api_management_api_policy" "server" {
 
   # Policy compilation resolves {{mcp-acl-<name>}} (plus the shared named values and
   # the mcp-acl-eval fragment the caller wires via depends_on on the module).
-  depends_on = [azapi_resource.server, azurerm_api_management_named_value.acl]
+  depends_on = [azapi_resource.server, azurerm_api_management_named_value.acl, azurerm_api_management_named_value.pat_map]
 }
