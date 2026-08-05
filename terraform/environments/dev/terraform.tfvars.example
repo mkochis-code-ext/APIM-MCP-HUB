@@ -73,11 +73,40 @@ mcp_hub_servers = {
       { match_type = "role", match_value = "Foundry.User", allow = ["*"] },
     ]
   }
+  # Azure Resource Manager MCP (remote, preview) - https://github.com/Azure/Azure-Resource-Manager-MCP
+  # Requires TWO one-time admin steps (see README "Consent"):
+  #   1. az ad sp create --id 22bfbae3-f4e7-485f-be43-8cee15065084  (first-party SP not in tenant by default)
+  #   2. oauth2PermissionGrant App A -> ARM MCP SP (delegated scope)
+  arm = {
+    backend_url = "https://mcp.management.azure.com/"
+    auth        = "obo"
+    obo_scope   = "22bfbae3-f4e7-485f-be43-8cee15065084/.default" # ARM MCP server first-party app
+    acl = [
+      { match_type = "role", match_value = "Arm.User", allow = ["*"] },
+    ]
+  }
   learn = {
     backend_url = "https://learn.microsoft.com/api/mcp"
     auth        = "none"
     acl = [
       { match_type = "any", allow = ["*"] },
+    ]
+  }
+  # GitHub MCP server (remote) - https://github.com/github/github-mcp-server
+  # GitHub auth (PAT), not Entra, so no OBO. auth = "pat": per-user lookup in the
+  # SECRET named value mcp-pat-github (Terraform creates it EMPTY and never touches
+  # the value again - ignore_changes). Register each user manually (OID -> PAT,
+  # single-quoted JSON):
+  #   az apim nv update -g <rg> --service-name <apim> --named-value-id mcp-pat-github `
+  #     --value "{'<caller-object-id>':'github_pat_...'}"
+  # Callers with no entry get 403 and never see github tools. DEMO ONLY - a
+  # production system needs a real secret store (Key Vault-backed named values /
+  # credential broker) with PAT rotation, not hand-edited named values.
+  github = {
+    backend_url = "https://api.githubcopilot.com/mcp/"
+    auth        = "pat"
+    acl = [
+      { match_type = "group", match_value = "33333333-3333-3333-3333-333333333333", allow = ["*"], deny = ["create_repository", "delete_file", "push_files", "create_or_update_file"] },
     ]
   }
 }

@@ -30,12 +30,12 @@ variable "backend_url" {
 }
 
 variable "auth" {
-  description = "Backend auth mode: \"obo\" (per-user token exchange) or \"none\" (public backend, caller auth stripped)"
+  description = "Backend auth mode: \"obo\" (per-user Entra token exchange), \"pat\" (per-user PAT from the manually maintained mcp-pat-<name> named-value map - demo pattern), or \"none\" (public backend, caller auth stripped)"
   type        = string
 
   validation {
-    condition     = contains(["obo", "none"], var.auth)
-    error_message = "auth must be \"obo\" or \"none\"."
+    condition     = contains(["obo", "pat", "none"], var.auth)
+    error_message = "auth must be \"obo\", \"pat\" or \"none\"."
   }
 }
 

@@ -182,7 +182,9 @@ variable "mcp_hub_servers" {
     prefixes (<key>__<tool>) and ACL named-value suffixes (mcp-acl-<key>) - keep them
     short, lowercase, [a-z0-9-].
       backend_url = full MCP endpoint URL (split into host + rewrite path internally)
-      auth        = "obo" (per-user token exchange) | "none" (public backend, auth stripped)
+      auth        = "obo" (per-user Entra token exchange) | "pat" (per-user PAT from the
+                    manually maintained mcp-pat-<key> named-value map - DEMO pattern for
+                    non-Entra backends like GitHub) | "none" (public backend, auth stripped)
       obo_scope   = Entra scope for the OBO exchange (required when auth = "obo")
       acl         = max 3 persona entries per server; each matches ONE token claim:
         match_type  = "role" | "group" | "scope" | "any"  (group matches the Entra object
@@ -223,8 +225,8 @@ variable "mcp_hub_servers" {
   }
 
   validation {
-    condition     = alltrue([for k, v in var.mcp_hub_servers : contains(["obo", "none"], v.auth)])
-    error_message = "auth must be \"obo\" or \"none\"."
+    condition     = alltrue([for k, v in var.mcp_hub_servers : contains(["obo", "pat", "none"], v.auth)])
+    error_message = "auth must be \"obo\", \"pat\" or \"none\"."
   }
 
   validation {
